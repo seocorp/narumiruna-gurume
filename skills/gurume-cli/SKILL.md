@@ -47,6 +47,7 @@ Flag guidance:
 - `--sort ranking` (default): good general "best of" results. Use `review-count` when the user wants popular/famous places, `new-open` for newly opened spots.
 - `--limit`: 10 is plenty for a conversational reply. Bump to 20+ only if the user asks for a long list.
 - `--output json`: preferred for agents. It returns `status`, `items`, `meta`, `applied_filters`, `warnings`, and structured `error` fields. Use legacy `--output json-list` only if you specifically need the old list-only shape.
+- `--transport browser`: when the JSON error reports HTTP 403, rerun the same search once with this flag. It opens a visible Chrome or Chromium window with Gurume's own profile and needs the `gurume[browser]` extra. If it also returns 403, surface the error instead of retrying.
 
 ### 4. Present results
 

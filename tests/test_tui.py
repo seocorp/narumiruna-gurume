@@ -28,7 +28,8 @@ async def test_tui_area_placeholder_uses_supported_name() -> None:
     [
         (
             SearchResponse(status=SearchStatus.ERROR, error_message="HTTP Error 403: ", http_status=403),
-            "Search failed: Tabelog denied access (HTTP 403). Retrying the same request will not help.",
+            "Search failed: Tabelog denied access (HTTP 403). Retrying the same request will not help. "
+            "Run gurume tui --transport browser.",
         ),
         (SearchResponse(status=SearchStatus.ERROR, error_message="HTTP Error 500"), "Search failed: HTTP Error 500"),
         (SearchResponse(status=SearchStatus.NO_RESULTS), "No restaurants found."),
@@ -119,3 +120,23 @@ async def test_tui_keyword_suggestion_error_is_english() -> None:
         message = str(app.query_one("#detail-content", Static).content)
         assert "Could not fetch keyword suggestions" in message
         assert "Error: offline" in message
+
+
+@pytest.mark.asyncio
+async def test_tui_browser_mode_uses_browser_search() -> None:
+    app = TabelogApp(use_browser=True)
+    async with app.run_test():
+        app.query_one("#area-input", Input).value = "Tokyo"
+        with (
+            patch(
+                "gurume.tui.SearchRequest.search_browser",
+                new_callable=AsyncMock,
+                return_value=SearchResponse(status=SearchStatus.NO_RESULTS),
+            ) as browser,
+            patch("gurume.tui.SearchRequest.search", new_callable=AsyncMock) as http,
+        ):
+            await app.perform_search()
+
+        browser.assert_awaited_once()
+        http.assert_not_awaited()
+        assert str(app.query_one("#detail-content", Static).content) == "No restaurants found."

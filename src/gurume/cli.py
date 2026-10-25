@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from .restaurant import resolve_sort_type
 from .search import SearchRequest
 from .search import SearchResponse
 from .search import SearchStatus
+from .server_helpers import _browser_search_error
 from .server_helpers import _build_search_error_output
 from .server_helpers import _build_search_output
 from .server_helpers import _restaurant_output_data
@@ -53,6 +55,13 @@ class OutputFormat(StrEnum):
     JSON_ENVELOPE = "json-envelope"
     JSON_LIST = "json-list"
     SIMPLE = "simple"
+
+
+class SearchTransport(StrEnum):
+    """Page retrieval for search."""
+
+    HTTP = "http"
+    BROWSER = "browser"
 
 
 class SortOption(StrEnum):
@@ -257,6 +266,13 @@ def search(
     sort: Annotated[SortOption, typer.Option("--sort", "-s", help="Sort order.")] = SortOption.RANKING,
     limit: Annotated[int, typer.Option("--limit", "-n", min=1, help="Number of results to display.")] = 20,
     output: Annotated[OutputFormat, typer.Option("--output", "-o", help="Output format.")] = OutputFormat.TABLE,
+    transport: Annotated[
+        SearchTransport,
+        typer.Option(
+            "--transport",
+            help="Page retrieval: browser opens an installed Chrome or Chromium when Tabelog answers HTTP with 403.",
+        ),
+    ] = SearchTransport.HTTP,
 ) -> None:
     """Search restaurants.
 
@@ -265,6 +281,7 @@ def search(
       gurume search -a 三重 -c すき焼き --sort ranking
       gurume search --area 大阪 --cuisine ラーメン -o json
       gurume search --area 大阪 --cuisine ラーメン -o json-list
+      gurume search --area 銀座 --cuisine 寿司 --transport browser
     """
     status_console = (
         err_console if output in (OutputFormat.JSON, OutputFormat.JSON_ENVELOPE, OutputFormat.JSON_LIST) else console
@@ -299,13 +316,18 @@ def search(
         max_pages=1,
     )
 
-    response = request.search_sync()
+    browser = transport == SearchTransport.BROWSER
+    response = asyncio.run(request.search_browser()) if browser else request.search_sync()
 
     if response.status.value == "error":
         status_console.print(f"[red]Search failed: {response.error_message}[/red]")
         if response.http_status == 403:
             status_console.print(
-                "[yellow]Tabelog denied access (HTTP 403); retrying the same request will not help.[/yellow]"
+                "[yellow]Tabelog asked the Gurume browser profile for verification (HTTP 403); "
+                "retrying the same request will not help.[/yellow]"
+                if browser
+                else "[yellow]Tabelog denied access (HTTP 403); retrying the same request will not help. "
+                "Try --transport browser.[/yellow]"
             )
         _output_error_envelope_if_requested(
             output,
@@ -313,7 +335,9 @@ def search(
             filters=filters,
             sort=sort,
             limit=limit,
-            error=_upstream_search_error(response.error_message, response.http_status),
+            error=_browser_search_error(response)
+            if browser
+            else _upstream_search_error(response.error_message, response.http_status),
         )
         raise typer.Exit(1)
 
@@ -467,11 +491,19 @@ def list_cuisines() -> None:
 
 
 @app.command()
-def tui() -> None:
+def tui(
+    transport: Annotated[
+        SearchTransport,
+        typer.Option(
+            "--transport",
+            help="Page retrieval: browser opens an installed Chrome or Chromium when Tabelog answers HTTP with 403.",
+        ),
+    ] = SearchTransport.HTTP,
+) -> None:
     """Launch the interactive TUI."""
     from .tui import main as tui_main
 
-    tui_main()
+    tui_main(use_browser=transport == SearchTransport.BROWSER)
 
 
 class McpTransport(StrEnum):

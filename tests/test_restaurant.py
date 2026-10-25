@@ -456,3 +456,52 @@ class TestMagazineFiltering:
         assert len(restaurants) == 1
         assert restaurants[0].name == "本物のレストラン"
         assert restaurants[0].url == "https://tabelog.com/tokyo/A1301/A130101/13000999/"
+
+
+# Current card markup observed on 2026-10-26 ranking pages, trimmed to the parsed elements.
+CURRENT_CARD_HTML = """
+<div class="js-rstlist-info rstlist-info">
+<div class="list-rst"><div class="list-rst__body">
+  <a class="list-rst__rst-name-target"
+  href="https://tabelog.com/tokyo/A1301/A130101/13164932/">むぎとオリーブ 銀座本店</a>
+  <div class="list-rst__area-genre">東銀座駅 253m /<mark
+  class="list-rst__search-keyword">ラーメン・つけ麺</mark>(ラーメン)、<mark
+  class="list-rst__search-keyword">ラーメン・つけ麺</mark>(つけ麺)</div>
+  <div class="list-rst__pr"><p class="list-rst__pr-title">蛤の旨みを閉じ込めたSOBA</p></div>
+  <span class="c-rating__val">3.76</span>
+  <ul class="list-rst__info">
+    <li class="list-rst__info-item"><i class="list-rst__holiday-icon"></i>
+    <span class="list-rst__holiday-text">HOLIDAY</span></li>
+  </ul>
+  <div class="list-rst__rst-photo">
+    <div class="list-rst__photo-item js-cassette-img" data-original="https://tblg.k-img.com/restaurant/images/Rvw/1/a.jpg"></div>
+    <img class="js-thumbnail-img" src="data:image/gif;base64,R0lGOD">
+  </div>
+</div></div>
+<div class="list-rst"><p>おいしいお店を発見 3.5以下のうまい店</p></div>
+</div>
+"""
+
+
+@pytest.mark.parametrize(("holiday", "closed_days"), [("水曜日", "水曜日"), ("-", None)])
+def test_parse_current_card_markup(holiday, closed_days):
+    restaurants = RestaurantSearchRequest()._parse_restaurants(CURRENT_CARD_HTML.replace("HOLIDAY", holiday))
+
+    assert len(restaurants) == 1
+    restaurant = restaurants[0]
+    assert restaurant.area == "東銀座駅 253m"
+    assert restaurant.station == "東銀座駅"
+    assert restaurant.distance == "253m"
+    assert restaurant.genres == ["ラーメン・つけ麺(ラーメン)", "ラーメン・つけ麺(つけ麺)"]
+    assert restaurant.description == "蛤の旨みを閉じ込めたSOBA"
+    assert restaurant.closed_days == closed_days
+    assert restaurant.image_urls == ["https://tblg.k-img.com/restaurant/images/Rvw/1/a.jpg"]
+
+
+@pytest.mark.parametrize(("reservation_time", "vac_net"), [("1900", "1"), (None, None)])
+def test_reservation_filter_requests_free_seats(reservation_time, vac_net):
+    params = RestaurantSearchRequest(
+        area="銀座", reservation_date="20261031", reservation_time=reservation_time, party_size=2
+    )._build_params()
+
+    assert params.get("vac_net") == vac_net

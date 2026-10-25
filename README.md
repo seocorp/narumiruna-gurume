@@ -105,6 +105,7 @@ Current `gurume search` options:
 - `--sort`, `-s`: `ranking`, `review-count`, `new-open`, `standard`
 - `--limit`, `-n`
 - `--output`, `-o`: `table`, `json`, `json-envelope`, `json-list`, `simple`
+- `--transport`: `http` (default) or `browser`; see Browser transport below
 
 Notes:
 
@@ -295,6 +296,7 @@ Local development:
    - `reservation_date`: `YYYYMMDD`
    - `reservation_time`: `HHMM`
    - `party_size`: positive integer
+   - `transport`: `http` (default) or `browser`; see Browser transport below
 
    Returns a structured `RestaurantSearchOutput` envelope with:
 
@@ -321,6 +323,7 @@ Local development:
    - `fetch_menu`: default `true`; set `false` to skip menu pages
    - `fetch_courses`: default `true`; set `false` to skip course pages
    - `max_review_pages`: minimum `1`, default `1`
+   - `transport`: `http` (default) or `browser`; the browser reads every requested page in one window
 
    All optional fetch flags may be `false` when only basic restaurant information is needed.
 
@@ -335,6 +338,27 @@ Local development:
    Optional `cuisine` (only `焼き鳥`), `page` (1-based), and `limit` (1–20).
    Returns a separate map envelope with coordinates, raw budgets, and rectangle-scoped metadata.
    This is not an exact prefecture/national ranking or an automatic fallback for HTTP 403.
+
+### Browser transport
+
+Tabelog's Cloudflare check can answer the default HTTP client with HTTP 403 for search and detail pages.
+`tabelog_search_restaurants` and `tabelog_get_restaurant_details` then accept `transport="browser"`: Gurume opens a
+visible Chrome or Chromium window with its own profile in `~/.cache/gurume/browser`, waits for the Cloudflare check to
+clear, reads the pages, and closes the window. The CLI takes the same choice as `gurume search --transport browser`
+and `gurume tui --transport browser`. Gurume never switches to the browser on its own.
+
+Requirements:
+
+- the `browser` extra, for example `uvx --from 'gurume[browser] @ git+https://github.com/narumiruna/gurume' gurume mcp`
+- an installed Chrome or Chromium on `PATH` as `google-chrome-stable`, `google-chrome`, `chromium`, or
+  `chromium-browser`, or its path in `GURUME_BROWSER_EXECUTABLE`; without either, run `playwright install chromium`
+- a graphical session for the visible window
+
+Gurume starts the browser without Playwright's `--enable-automation` flag and with the `AutomationControlled` Blink
+feature disabled, so pages do not see `navigator.webdriver`. Cloudflare kept challenging a browser that reported it.
+If the check still does not clear within the navigation timeout, the tool returns HTTP 403. Open Tabelog in the same
+profile, for example `chromium --user-data-dir="$HOME/.cache/gurume/browser" https://tabelog.com`, complete the check,
+close that window, and retry once.
 
 ### 📋 Recommended MCP Workflow
 
@@ -406,6 +430,8 @@ Start the Textual TUI with:
 ```bash
 uv run gurume tui
 ```
+
+Add `--transport browser` when Tabelog answers HTTP searches with 403; see Browser transport above.
 
 Or:
 

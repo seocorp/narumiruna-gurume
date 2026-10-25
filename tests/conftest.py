@@ -1,8 +1,16 @@
 """Test configuration and fixtures"""
 
+from unittest.mock import AsyncMock
 from unittest.mock import Mock
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def offline_area_suggestions(monkeypatch):
+    """Keep searches offline: area lookups behave like a failed suggestion request unless a test overrides them."""
+    monkeypatch.setattr("gurume.search.get_area_suggestions", Mock(return_value=[]))
+    monkeypatch.setattr("gurume.search.get_area_suggestions_async", AsyncMock(return_value=[]))
 
 
 @pytest.fixture
@@ -47,10 +55,13 @@ def mock_html_response():
 def restaurant_cards_case(request: pytest.FixtureRequest) -> tuple[str, list[str], int]:
     """Shared markup cases for restaurant parsing and raw-card metadata counts."""
 
+    restaurant_ids = {"first": "13000001", "second": "13000002", "ignored": "13000003"}
+
     def card(tag: str, name: str) -> str:
+        # Each card is a different restaurant; the same URL twice is one restaurant listed twice.
         return (
             f'<{tag} class="list-rst"><a class="list-rst__rst-name-target" '
-            f'href="/tokyo/A1301/A130101/13000001/">{name}</a></{tag}>'
+            f'href="/tokyo/A1301/A130101/{restaurant_ids[name]}/">{name}</a></{tag}>'
         )
 
     div_cards = card("div", "first") + card("div", "second")

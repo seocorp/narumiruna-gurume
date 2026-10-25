@@ -586,3 +586,120 @@ class TestRestaurantDetailRequest:
 
         assert isinstance(detail, RestaurantDetail)
         assert mock_get.call_count == 4
+
+
+# Current detail, review, menu, and course markup observed on 2026-10-26, trimmed to the parsed elements.
+DETAIL_URL = "https://tabelog.com/tokyo/A1301/A130103/13267696"
+CURRENT_DETAIL_HTML = """
+<html><head><meta name="description" content="焼鳥 ひら野 (東銀座/焼き鳥)の店舗情報は食べログでチェック！"></head><body>
+<div class="rdheader-counts"><a class="rdheader-rating__hozon-target">保存 <em class="num">33904</em> 人</a></div>
+<dl class="rdheader-subinfo__item rdheader-subinfo__item--station"><dt>最寄り駅：</dt><dd><div class="linktree">
+<div class="linktree__parent"><a class="linktree__parent-target">
+<span class="linktree__parent-target-text">東銀座駅</span></a>
+</div></div></dd></dl>
+<dl class="rdheader-subinfo__item"><dt>予算：</dt><dd><div class="rdheader-budget">
+<p class="c-rating-v3 rdheader-budget__icon"><i class="c-rating-v3__time c-rating-v3__time--dinner"></i>
+<span class="c-rating-v3__val"><a class="rdheader-budget__price-target">￥15,000～￥19,999</a></span></p>
+<p class="c-rating-v3 rdheader-budget__icon"><i class="c-rating-v3__time c-rating-v3__time--lunch"></i>
+<span class="c-rating-v3__val"><a class="rdheader-budget__price-target">-</a></span></p>
+</div></dd></dl>
+<dl class="rdheader-subinfo__item"><dt>定休日：</dt><dd class="rdheader-subinfo__closed-text">日曜日、祝日</dd></dl>
+<div class="pr-comment-wrap"><h3 class="pr-comment-title">鶏肉の水分量は増やせない、動かさないだけ。</h3>
+<p class="pr-comment__body"><span class="pr-comment__first">串打ち（圧）塩（制）焼き（封）<br>おまかせコースのみ</span>
+<span class="js-pr-comment-more">...</span>
+<button class="pr-comment__more js-pr-comment-more">続きを読む</button></p></div>
+<table>
+<tr><th>交通手段</th><td>銀座線新橋駅から徒歩5分。 東銀座駅から420m</td></tr>
+<tr><th>営業時間</th><td>月・火・水・木・金・土 16:00 - 23:00 日・祝日 定休日</td></tr>
+</table>
+<a href="https://tabelog.com/ai_request_booking/guide/index">ネット予約（リクエスト予約）</a>
+<a href="/tokyo/A1301/A130103/13267696/dtlrvwlst/B1/">予約争奪戦の名店</a>
+<a href="/booking/form/new?member=2&amp;rcd=13267696&amp;visit_date=20261027">予約する</a>
+</body></html>
+"""
+
+
+def test_parse_restaurant_current_header():
+    restaurant = RestaurantDetailRequest(restaurant_url=DETAIL_URL + "/")._parse_restaurant(
+        CURRENT_DETAIL_HTML, DETAIL_URL
+    )
+
+    assert restaurant.station == "東銀座駅"
+    assert restaurant.distance == "420m"
+    assert restaurant.save_count == 33904
+    assert restaurant.dinner_price == "￥15,000～￥19,999"
+    assert restaurant.lunch_price is None
+    assert restaurant.closed_days == "日曜日、祝日"
+    assert restaurant.description == (
+        "鶏肉の水分量は増やせない、動かさないだけ。\n串打ち（圧）塩（制）焼き（封）\nおまかせコースのみ"
+    )
+    assert restaurant.reservation_url == "https://tabelog.com/booking/form/new?member=2&rcd=13267696&visit_date=20261027"
+
+
+def test_reservation_url_ignores_site_wide_and_review_links():
+    booking_link = '<a href="/booking/form/new?member=2&amp;rcd=13267696&amp;visit_date=20261027">予約する</a>'
+    html = CURRENT_DETAIL_HTML.replace(booking_link, "")
+
+    restaurant = RestaurantDetailRequest(restaurant_url=DETAIL_URL + "/")._parse_restaurant(html, DETAIL_URL)
+
+    assert restaurant.reservation_url is None
+
+
+def test_parse_reviews_current_markup():
+    html = """
+    <div class="rvw-item"><a class="rvw-item__rvwr-name">reviewer-a</a>
+    <div class="rvw-item__ratings"><p class="c-rating-v3 rvw-item__ratings-total">
+    <b class="c-rating-v3__val rvw-item__ratings--val">4.2</b></p></div>
+    <div class="rvw-item__date"><span>2024/11訪問</span>
+    <span class="rvw-item__count-num">1</span><span>回目</span></div>
+    <p class="rvw-item__title"><a><strong>カエシがなくてもスープが絶品!
+                本来のスープの旨味</strong></a></p>
+    <div class="rvw-item__rvw-comment"><p>群雄割拠な焼き鳥業界...</p></div></div>
+    <div class="rvw-item"><a class="rvw-item__rvwr-name">reviewer-b</a>
+    <p class="c-rating-v3 rvw-item__ratings-total"><b class="c-rating-v3__val">3.6</b></p>
+    <div class="rvw-item__rvw-comment"><p>銀座にある人気ラーメン店...</p></div></div>
+    """
+
+    reviews = RestaurantDetailRequest(restaurant_url=DETAIL_URL + "/")._parse_reviews(html)
+
+    assert [review.rating for review in reviews] == [4.2, 3.6]
+    assert reviews[0].visit_date == "2024/11訪問1回目"
+    assert reviews[0].title == "カエシがなくてもスープが絶品! 本来のスープの旨味"
+    assert reviews[1].title is None
+
+
+def test_parse_menu_current_markup():
+    html = """
+    <div class="rstdtl-menu-lst">
+    <div class="rstdtl-menu-lst__heading"><h4 class="rstdtl-menu-lst__title">麺類</h4></div>
+    <div class="rstdtl-menu-lst__contents"><div class="rstdtl-menu-lst__info"><div class="rstdtl-menu-lst__info-inner">
+    <p class="rstdtl-menu-lst__menu-title">特製中華そば</p><p class="rstdtl-menu-lst__price">1,600円</p></div>
+    <p class="rstdtl-menu-lst__ex">チャーシューを1枚増量</p></div></div>
+    <div class="rstdtl-menu-lst__heading"><h4 class="rstdtl-menu-lst__title">焼鳥(コース追加メニュー）</h4></div>
+    <div class="rstdtl-menu-lst__contents"><p class="rstdtl-menu-lst__menu-title">かしわ</p></div>
+    </div>
+    """
+
+    menu_items = RestaurantDetailRequest(restaurant_url=DETAIL_URL + "/")._parse_menu_items(html)
+
+    assert menu_items == [
+        MenuItem(name="特製中華そば", price="1,600円", description="チャーシューを1枚増量", category="麺類"),
+        MenuItem(name="かしわ", price=None, description=None, category="焼鳥(コース追加メニュー）"),
+    ]
+
+
+def test_parse_course_current_description():
+    # The description keeps the page's indented blank line between paragraphs.
+    html = (
+        '<div class="rstdtl-course-list">'
+        '<span class="rstdtl-course-list__course-title-text">ワインペアリングコース</span>'
+        '<span class="rstdtl-course-list__label">20品</span>'
+        '<p class="rstdtl-course-list__desc">ペアリングとは要素です。\n            \n'
+        "            1 杯目はスパークリングワイン</p>"
+        '<span class="rstdtl-course-list__price-num"><em>15,800</em>円</span></div>'
+    )
+
+    (course,) = RestaurantDetailRequest(restaurant_url=DETAIL_URL + "/")._parse_courses(html)
+
+    assert course.description == "ペアリングとは要素です。\n1 杯目はスパークリングワイン"
+    assert course.items == ["20品"]

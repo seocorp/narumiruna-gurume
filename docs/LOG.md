@@ -106,3 +106,6 @@
 2026-10-09 | fix(mcp): preserve retryability for transient browser search failures (#96)
 2026-10-09 | fix(browser): recover validated timeout content and classify profile, empty-result and HTTP failures (#96)
 2026-10-09 | fix(browser): preserve shared textual area-not-found handling (#96)
+2026-10-26 | fix(browser): wait for Cloudflare checks in an installed Chrome or Chromium without automation markers and add browser detail retrieval
+2026-10-26 | fix(parsers): read current Tabelog markup for cards, page size, detail header, reviews, menus, and courses; add CLI and TUI --transport browser
+2026-10-26 | fix(search): send area suggestion IDs on keyword searches, page through the redirected area list, dedupe name-match sections, and filter reservations with vac_net

@@ -14,6 +14,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from .browser import BrowserRetrievalError
 from .detail import RestaurantDetailRequest
 from .genre_mapping import get_all_genres
 from .genre_mapping import get_genre_code
@@ -25,6 +26,7 @@ from .map_output import validate_map_limit
 from .map_search import MapSearchRequest
 from .search import SearchRequest
 from .search import SearchStatus
+from .server_helpers import _browser_error
 from .server_helpers import _browser_search_error
 from .server_helpers import _build_cuisine_list_error_output
 from .server_helpers import _build_cuisine_list_output
@@ -121,6 +123,8 @@ Optional Step 4: Filter by reservation availability
 - Use reservation filters to check availability on specific dates
 - For explicit geographic bounds, use tabelog_search_map_restaurants (currently yakitori only).
   Map results and totals are NOT exact prefecture or national rankings; never silently substitute them.
+- When search or detail returns HTTP 403, call the same tool once with transport="browser". It opens a visible
+  Chrome or Chromium window with Gurume's own profile, waits for Tabelog's Cloudflare check, and is never automatic.
 
 Example:
 User: "Find sukiyaki in Tokyo available April 27 at 7pm for 2 people"
@@ -221,7 +225,13 @@ async def tabelog_search_restaurants(
     ] = None,
     transport: Annotated[
         Literal["http", "browser"],
-        Field(default="http", description="Explicit transport: browser opens headed Chromium, not automatic fallback."),
+        Field(
+            default="http",
+            description=(
+                "Explicit transport: browser opens an installed Chrome or Chromium with Gurume's own profile and waits "
+                "for Tabelog's Cloudflare check. It is not an automatic fallback."
+            ),
+        ),
     ] = "http",
 ) -> RestaurantSearchOutput:
     """Search Tabelog restaurants with validated filters and pagination metadata.
@@ -382,10 +392,22 @@ async def tabelog_get_restaurant_details(
             ge=1,
         ),
     ] = 1,
+    transport: Annotated[
+        Literal["http", "browser"],
+        Field(
+            default="http",
+            description=(
+                "Explicit transport: browser reads every page in an installed Chrome or Chromium with Gurume's own "
+                "profile and waits for Tabelog's Cloudflare check. It is not an automatic fallback."
+            ),
+        ),
+    ] = "http",
 ) -> RestaurantDetailOutput:
     """Fetch base restaurant information and optional reviews, menu items, and courses."""
     try:
         _validate_detail_params(restaurant_url, fetch_reviews, fetch_menu, fetch_courses, max_review_pages)
+        if transport not in {"http", "browser"}:
+            raise ValueError("transport must be http or browser")
         request = RestaurantDetailRequest(
             restaurant_url=restaurant_url,
             fetch_reviews=fetch_reviews,
@@ -393,7 +415,7 @@ async def tabelog_get_restaurant_details(
             fetch_courses=fetch_courses,
             max_review_pages=max_review_pages,
         )
-        detail = await request.fetch()
+        detail = await (request.fetch_browser() if transport == "browser" else request.fetch())
     except ValueError as e:
         error = ToolErrorOutput(
             error_code="invalid_parameters",
@@ -418,12 +440,21 @@ async def tabelog_get_restaurant_details(
             )
         )
     except RuntimeError as e:
-        error = ToolErrorOutput(
-            error_code="upstream_unavailable",
-            message="Restaurant detail request failed because the upstream service did not return usable data.",
-            retryable=True,
-            suggested_action="Verify the restaurant URL from search results and retry later.",
-            detail=str(e),
+        error = (
+            _browser_error(
+                operation="detail request",
+                http_status=e.status if isinstance(e, BrowserRetrievalError) else None,
+                retryable=isinstance(e, BrowserRetrievalError) and e.retryable,
+                detail=str(e),
+            )
+            if transport == "browser"
+            else ToolErrorOutput(
+                error_code="upstream_unavailable",
+                message="Restaurant detail request failed because the upstream service did not return usable data.",
+                retryable=True,
+                suggested_action="Verify the restaurant URL from search results and retry later.",
+                detail=str(e),
+            )
         )
     except Exception as e:  # noqa: BLE001
         error = ToolErrorOutput(

@@ -24,7 +24,7 @@ class PlaywrightTimeoutError(PlaywrightError):
 @pytest.fixture
 def browser(monkeypatch, tmp_path):
     page = SimpleNamespace(
-        goto=AsyncMock(return_value=SimpleNamespace(status=200)),
+        goto=AsyncMock(return_value=SimpleNamespace(status=200, headers={})),
         content=AsyncMock(return_value='<div class="c-page-count">0</div>'),
         url="https://tabelog.com/mie/rstLst/",
         on=Mock(),
@@ -280,3 +280,48 @@ async def test_permanent_http_recovery_action(browser, status):
     assert "verification" not in action.lower()
     assert "installation" not in action.lower()
     assert "rate limits" in action if status == 429 else "URL" in action
+
+
+def _main_frame_response(page, status):
+    return SimpleNamespace(
+        status=status,
+        frame=page.main_frame,
+        request=SimpleNamespace(is_navigation_request=lambda: True),
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleared_challenge_uses_reloaded_document(browser):
+    page, context, _ = browser
+    page.goto.return_value = SimpleNamespace(status=403, headers={"cf-mitigated": "challenge"})
+
+    async def challenge_cleared(*_args, **_kwargs):
+        page.on.call_args.args[1](_main_frame_response(page, 200))
+
+    page.wait_for_function = AsyncMock(side_effect=challenge_cleared)
+    page.content.return_value = CARD_HTML
+    _, result = await mcp.call_tool("tabelog_search_restaurants", {"area": "三重", "transport": "browser"})
+    assert isinstance(result, dict)
+    assert result["status"] == "success"
+    assert result["items"][0]["name"] == "こま田"
+    page.wait_for_function.assert_awaited_once()
+    context.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_uncleared_challenge_is_verification_failure(browser):
+    page, context, _ = browser
+    page.goto.return_value = SimpleNamespace(status=403, headers={"cf-mitigated": "challenge"})
+
+    async def challenge_remains(*_args, **_kwargs):
+        page.on.call_args.args[1](_main_frame_response(page, 403))
+        raise PlaywrightTimeoutError("Challenge still shown")
+
+    page.wait_for_function = AsyncMock(side_effect=challenge_remains)
+    page.content.return_value = "<title>잠시만 기다리십시오…</title>"
+    _, result = await mcp.call_tool("tabelog_search_restaurants", {"area": "三重", "transport": "browser"})
+    assert isinstance(result, dict)
+    assert result["status"] == "error"
+    assert result["error"]["retryable"] is False
+    assert "verification" in result["error"]["suggested_action"].lower()
+    context.close.assert_awaited_once()

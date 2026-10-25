@@ -19,6 +19,7 @@ from .restaurant import Restaurant
 DETAIL_PARSE_EXCEPTIONS = (AttributeError, TypeError, ValueError)
 PHONE_PATTERN = re.compile(r"0\d{1,4}-\d{1,4}-\d{3,4}|0\d{9,10}")
 STATION_PATTERN = re.compile(r"([^\s、,，]+駅)")
+DISTANCE_PATTERN = re.compile(r"([^\s、,，。]+駅)から\s*([\d,.]+\s?k?m)")
 BUDGET_PATTERN = re.compile(r"￥[^\s]+")
 
 
@@ -113,7 +114,25 @@ class RestaurantDetailRequest:
         soup = BeautifulSoup(html, "html.parser")
         menu_items = []
 
-        # Find all menu categories.
+        # Current menu pages list a category heading followed by its items, in document order.
+        category = None
+        for element in soup.select(".rstdtl-menu-lst__heading, .rstdtl-menu-lst__contents"):
+            if "rstdtl-menu-lst__heading" in element.get_attribute_list("class"):
+                category = self._get_text(element.select_one(".rstdtl-menu-lst__title"))
+                continue
+            with contextlib.suppress(*DETAIL_PARSE_EXCEPTIONS):
+                menu_items.append(
+                    MenuItem(
+                        name=self._get_required_text(element.select_one(".rstdtl-menu-lst__menu-title")),
+                        price=self._get_text(element.select_one(".rstdtl-menu-lst__price")),
+                        description=self._get_text(element.select_one(".rstdtl-menu-lst__ex")),
+                        category=category,
+                    )
+                )
+        if menu_items:
+            return menu_items
+
+        # Legacy menu pages: find all menu categories.
         menu_sections = soup.find_all("div", class_="c-offerlist-item")
 
         for section in menu_sections:
@@ -146,12 +165,17 @@ class RestaurantDetailRequest:
     def _parse_review(self, item: Any) -> Review | None:
         reviewer = self._get_required_text(item.find("a", class_="rvw-item__rvwr-name"))
         content = self._get_required_text(item.find("div", class_="rvw-item__rvw-comment"))
+        title = self._get_text(item.select_one(".rvw-item__title, .rvw-item__rvw-title"), separator=" ")
         return Review(
             reviewer=reviewer,
             content=content,
-            rating=self._parse_float(item.find("span", class_="c-rating__val")),
-            visit_date=self._get_text(item.find("p", class_="rvw-item__date")),
-            title=self._get_text(item.find("p", class_="rvw-item__rvw-title")),
+            rating=self._parse_float(
+                item.select_one(".rvw-item__ratings--val, .rvw-item__ratings-total .c-rating-v3__val")
+                or item.find("span", class_="c-rating__val")
+            ),
+            visit_date=self._get_text(item.find(class_="rvw-item__date")),
+            # Titles wrap across indented markup lines; keep one space between the parts.
+            title=" ".join(title.split()) if title else None,
             helpful_count=self._parse_int(item.find("em", class_="rvw-item__usefulpost-count")),
         )
 
@@ -186,10 +210,14 @@ class RestaurantDetailRequest:
         if item_count := self._get_text(item.find(class_="rstdtl-course-list__label")):
             items.append(item_count)
 
+        description = self._get_text(
+            item.select_one(".rstdtl-course-list__desc, .rstdtl-course-list__course-comment"), separator=" "
+        )
         return Course(
             name=name,
             price=self._get_text(item.find(class_="rstdtl-course-list__price-num"), separator=" "),
-            description=self._get_text(item.find(class_="rstdtl-course-list__course-comment"), separator=" "),
+            # Course text keeps the page's line breaks, but not the HTML indentation around them.
+            description=re.sub(r"\s*\n\s*", "\n", description) if description else None,
             items=items,
         )
 
@@ -223,22 +251,31 @@ class RestaurantDetailRequest:
 
         address = self._extract_address(ld_data) or info_map.get("住所")
         traffic_text = info_map.get("交通手段")
+        station = self._extract_station(soup, traffic_text)
+        header_budgets = self._extract_header_budgets(soup)
+        lunch_price, dinner_price = (
+            header_budgets
+            if header_budgets is not None
+            else (self._extract_budget(soup, index=1), self._extract_budget(soup, index=0))
+        )
 
         return Restaurant(
             name=self._extract_restaurant_name(soup, ld_data),
             url=base_url,
             rating=self._extract_rating(soup, ld_data),
             review_count=self._extract_review_count(soup, ld_data),
+            save_count=self._parse_count(soup.select_one(".rdheader-rating__hozon-target .num")),
             area=self._extract_area(ld_data, address),
-            station=self._extract_station(soup, traffic_text),
+            station=station,
+            distance=self._extract_distance(traffic_text, station),
             genres=self._extract_genres(soup, ld_data, info_map),
             description=self._extract_description(soup, ld_data),
-            lunch_price=self._extract_budget(soup, index=1),
-            dinner_price=self._extract_budget(soup, index=0),
+            lunch_price=lunch_price,
+            dinner_price=dinner_price,
             address=address,
             phone=self._extract_phone(info_map),
             business_hours=info_map.get("営業時間") or info_map.get("営業時間・定休日"),
-            closed_days=info_map.get("定休日"),
+            closed_days=self._get_text(soup.select_one(".rdheader-subinfo__closed-text")) or info_map.get("定休日"),
             reservation_url=self._extract_reservation_url(soup, base_url),
             image_urls=self._extract_image_urls(ld_data),
         )
@@ -367,6 +404,10 @@ class RestaurantDetailRequest:
         return None
 
     def _extract_station(self, soup: BeautifulSoup, traffic_text: str | None) -> str | None:
+        # The header names the nearest station; the access text mixes line names into station names.
+        if text := self._get_text(soup.select_one(".rdheader-subinfo__item--station .linktree__parent-target-text")):
+            return text
+
         if traffic_text:
             if match := STATION_PATTERN.search(traffic_text):
                 return match.group(1)
@@ -377,6 +418,14 @@ class RestaurantDetailRequest:
             return match.group(1).strip()
 
         return None
+
+    def _extract_distance(self, traffic_text: str | None, station: str | None) -> str | None:
+        """Read the walking distance from access text such as `東銀座駅から420m`."""
+        matches = DISTANCE_PATTERN.findall(traffic_text or "")
+        for match_station, distance in matches:
+            if match_station == station:
+                return distance.replace(" ", "")
+        return matches[-1][1].replace(" ", "") if matches else None
 
     def _extract_genres(
         self,
@@ -404,6 +453,16 @@ class RestaurantDetailRequest:
         if ld_data and isinstance(ld_data.get("description"), str) and ld_data["description"].strip():
             return ld_data["description"].strip()
 
+        if pr_comment := self._extract_pr_comment(soup):
+            return pr_comment
+
+        for selector in ("p.rdheader-caption__comment", "div.rdheader-caption__comment"):
+            if element := soup.select_one(selector):
+                text = element.get_text(" ", strip=True)
+                if text:
+                    return text
+
+        # Meta descriptions wrap the restaurant's own text in Tabelog's generic page summary.
         for meta in (
             soup.find("meta", attrs={"name": "description"}),
             soup.find("meta", attrs={"property": "og:description"}),
@@ -413,13 +472,36 @@ class RestaurantDetailRequest:
                 if isinstance(content, str) and content.strip():
                     return content.strip()
 
-        for selector in ("p.rdheader-caption__comment", "div.rdheader-caption__comment"):
-            if element := soup.select_one(selector):
-                text = element.get_text(" ", strip=True)
-                if text:
-                    return text
-
         return None
+
+    def _extract_pr_comment(self, soup: BeautifulSoup) -> str | None:
+        """Read the restaurant's own PR title and body without the collapsed-text controls."""
+        title = self._get_text(soup.select_one(".pr-comment-title"))
+        body = soup.select_one(".pr-comment__body")
+        if body is not None:
+            for control in body.select(".js-pr-comment-more"):
+                control.decompose()
+        body_text = self._get_text(body, separator="\n")
+        return "\n".join(text for text in (title, body_text) if text) or None
+
+    def _extract_header_budgets(self, soup: BeautifulSoup) -> tuple[str | None, str | None] | None:
+        """Read lunch and dinner budgets from the header icons; `-` means no budget for that meal."""
+        icons = soup.select(".rdheader-budget__icon")
+        if not icons:
+            return None
+
+        budgets: dict[str, str] = {}
+        for icon in icons:
+            time_icon = icon.select_one(".c-rating-v3__time")
+            time_classes = " ".join(time_icon.get_attribute_list("class")) if time_icon else ""
+            meal = "dinner" if "--dinner" in time_classes else "lunch" if "--lunch" in time_classes else None
+            if meal and (match := BUDGET_PATTERN.search(icon.get_text(" ", strip=True))):
+                budgets[meal] = match.group(0)
+        return budgets.get("lunch"), budgets.get("dinner")
+
+    def _parse_count(self, element: Any) -> int | None:
+        text = self._get_text(element)
+        return int(text.replace(",", "")) if text and text.replace(",", "").isdigit() else None
 
     def _extract_budget(self, soup: BeautifulSoup, index: int) -> str | None:
         text = soup.get_text("\n", strip=True)
@@ -443,13 +525,18 @@ class RestaurantDetailRequest:
         return None
 
     def _extract_reservation_url(self, soup: BeautifulSoup, base_url: str) -> str | None:
+        # Site-wide links such as the request-booking guide also say 予約; only links naming this restaurant count.
+        restaurant_id = base_url.rstrip("/").rsplit("/", 1)[-1]
         candidates: list[tuple[int, str]] = []
         for link in soup.find_all("a", href=True):
             text = link.get_text(" ", strip=True)
             href = link.get("href")
             if not text or not isinstance(href, str) or "予約" not in text:
                 continue
-            if text in {"予約確認", "予約内容確認"}:
+            if text in {"予約確認", "予約内容確認"} or restaurant_id not in href:
+                continue
+            # Review titles can mention 予約 and link to this restaurant's review pages.
+            if not any(token in href for token in ("reserve", "booking", "yoyaku")):
                 continue
 
             score = 0
@@ -609,4 +696,47 @@ class RestaurantDetailRequest:
             reviews=reviews,
             menu_items=menu_items,
             courses=courses,
+        )
+
+    async def fetch_browser(self) -> RestaurantDetail:
+        """Fetch restaurant details with the explicitly requested headed browser, reading every page in one page."""
+        from .browser import BrowserRetrievalError
+        from .browser import fetch_documents
+
+        base_url = self._get_base_url()
+        review_urls = [
+            f"{base_url}/dtlrvwlst/" + (f"?PG={page}" if page > 1 else "")
+            for page in range(1, self.max_review_pages + 1)
+            if self.fetch_reviews
+        ]
+        menu_url = f"{base_url}/dtlmenu/"
+        course_url = f"{base_url}/party/"
+        urls = [base_url, *review_urls]
+        if self.fetch_menu:
+            urls.append(menu_url)
+        if self.fetch_courses:
+            urls.append(course_url)
+        documents = dict(zip(urls, await fetch_documents(urls, 30.0), strict=True))
+
+        def read(url: str) -> str:
+            document = documents[url]
+            if document.status >= 400:
+                raise BrowserRetrievalError(
+                    f"HTTP Error {document.status}: Browser detail request failed for {url}",
+                    status=document.status,
+                )
+            return document.html
+
+        def read_optional(url: str) -> str | None:
+            return None if documents[url].status == 404 else read(url)
+
+        restaurant = self._parse_restaurant(read(base_url), base_url)
+        reviews = [review for url in review_urls for review in self._parse_reviews(read(url))]
+        menu_html = read_optional(menu_url) if self.fetch_menu else None
+        course_html = read_optional(course_url) if self.fetch_courses else None
+        return RestaurantDetail(
+            restaurant=restaurant,
+            reviews=reviews,
+            menu_items=self._parse_menu_items(menu_html) if menu_html else [],
+            courses=self._parse_courses(course_html) if course_html else [],
         )

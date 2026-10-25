@@ -746,3 +746,22 @@ class TestMcpCommand:
                 port=9001,
                 path="/api/mcp",
             )
+
+
+def test_search_browser_transport_uses_browser_retrieval():
+    from unittest.mock import AsyncMock
+
+    from typer.testing import CliRunner
+
+    from gurume.cli import app
+
+    response = SearchResponse(status=SearchStatus.NO_RESULTS)
+    with (
+        patch("gurume.search.SearchRequest.search_browser", AsyncMock(return_value=response)) as browser,
+        patch("gurume.search.SearchRequest.search_sync") as http,
+    ):
+        result = CliRunner().invoke(app, ["search", "--area", "東京", "--transport", "browser"])
+
+    assert result.exit_code == 0
+    browser.assert_awaited_once()
+    http.assert_not_called()

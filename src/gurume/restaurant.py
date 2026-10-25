@@ -27,6 +27,8 @@ DISPLAYED_DINNER_MARKERS = ("ディナー", "夜")
 DISPLAYED_LUNCH_MARKERS = ("ランチ", "昼")
 CLASS_DINNER_MARKERS = ("dinner",)
 CLASS_LUNCH_MARKERS = ("lunch",)
+STATION_DISTANCE_RE = re.compile(r"(?P<station>\S+駅)\s*(?P<distance>[\d,.]+\s?k?m)?")
+SEARCH_ENDPOINT = "https://tabelog.com/rst/rstsearch"
 
 # Tabelog restaurant detail URLs follow `/{area}/A{area_code}/A{subarea_code}/{rst_id}/`.
 # This pattern excludes magazine articles, promotional pages, and other non-restaurant links.
@@ -63,7 +65,7 @@ def build_search_url_and_params(
     Returns:
         Tuple of (url, params).
     """
-    url = "https://tabelog.com/rst/rstsearch"
+    url = SEARCH_ENDPOINT
     cuisine_slug = get_cuisine_slug_by_code(genre_code) if genre_code else None
     keyword = params.get("sk")
     if keyword:
@@ -250,6 +252,9 @@ class RestaurantSearchRequest:
             params["svt"] = self.reservation_time
         if self.party_size:
             params["svps"] = str(self.party_size)
+        if self.reservation_date and self.reservation_time:
+            # The date, time, and party size only reorder results; `vac_net` keeps restaurants with a free seat.
+            params["vac_net"] = "1"
 
     def _apply_filter_params(self, params: dict[str, str]) -> None:
         if self.price_range:
@@ -282,11 +287,14 @@ class RestaurantSearchRequest:
             return []
 
         restaurant_items = _find_restaurant_cards(soup)
+        # Keyword pages list restaurant-name matches above the paged results, which repeat most of them.
+        seen_urls: set[str] = set()
 
         for item in restaurant_items:
             try:
                 restaurant = self._parse_restaurant_item(item)
-                if restaurant is not None:
+                if restaurant is not None and restaurant.url not in seen_urls:
+                    seen_urls.add(restaurant.url)
                     restaurants.append(restaurant)
             except ITEM_PARSE_EXCEPTIONS:
                 # Skip malformed items.
@@ -301,8 +309,9 @@ class RestaurantSearchRequest:
 
         review_count, save_count, rating = self._parse_counts(item)
         area, station, distance, genres = self._parse_area_and_genres(item)
-        description = self._get_text(item.find("div", class_="list-rst__catch"))
+        description = self._get_text(item.select_one(".list-rst__pr-title, .list-rst__catch"))
         lunch_price, dinner_price = self._parse_prices(item)
+        closed_days = self._get_text(item.find(class_="list-rst__holiday-text"))
 
         return Restaurant(
             name=name,
@@ -317,6 +326,8 @@ class RestaurantSearchRequest:
             description=description,
             lunch_price=lunch_price,
             dinner_price=dinner_price,
+            # Cards show `-` when the restaurant has no listed closed days.
+            closed_days=None if closed_days == "-" else closed_days,
             has_vpoint=bool(item.find("span", class_="c-badge-tpoint")),
             has_reservation=bool(item.find("div", class_="list-rst__booking-btn")),
             image_urls=self._parse_image_urls(item),
@@ -361,12 +372,13 @@ class RestaurantSearchRequest:
 
         area_genre_text = area_genre_elem.get_text(strip=True).strip()
         if "/" in area_genre_text:
-            parts = area_genre_text.split("/")
-            if len(parts) >= 2:
-                area = self._strip_prefecture(parts[0].strip())
-                genre_part = parts[1].strip()
-                if genre_part:
-                    genres = [genre_part]
+            # Current cards read `東銀座駅 253m / ラーメン・つけ麺(ラーメン)、ラーメン・つけ麺(つけ麺)`.
+            location, _, genre_part = area_genre_text.partition("/")
+            area = self._strip_prefecture(location.strip())
+            if station_match := STATION_DISTANCE_RE.fullmatch(location.strip()):
+                station = station_match.group("station")
+                distance = (station_match.group("distance") or "").replace(" ", "") or None
+            genres = [genre.strip() for genre in genre_part.split("、") if genre.strip()]
             return area, station, distance, genres
 
         if "、" in area_genre_text:
@@ -475,6 +487,14 @@ class RestaurantSearchRequest:
         return genres
 
     def _parse_image_urls(self, item: Any) -> list[str]:
+        # Current cards lazy-load photos: the real URL is in `data-original`, while `src` holds a placeholder.
+        lazy_urls = [
+            url
+            for element in item.select(".list-rst__rst-photo [data-original]")
+            if isinstance(url := element.get("data-original"), str) and url.startswith("http")
+        ]
+        if lazy_urls:
+            return list(dict.fromkeys(lazy_urls))
         img_elem = item.find("img", class_="list-rst__photo-img")
         if img_elem and img_elem.get("src"):
             return [img_elem.get("src")]

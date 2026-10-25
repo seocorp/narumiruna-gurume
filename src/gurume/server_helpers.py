@@ -51,30 +51,45 @@ def _upstream_access_denied_error(operation: str, detail: str | None) -> ToolErr
     )
 
 
-def _browser_search_error(response: SearchResponse) -> ToolErrorOutput:
-    message = "Headed browser search did not return usable results."
+def _browser_error(
+    *,
+    operation: Literal["search", "detail request"],
+    http_status: int | None,
+    retryable: bool,
+    detail: str | None,
+) -> ToolErrorOutput:
+    message = f"Headed browser {operation} did not return usable results."
     action = (
         "Check browser installation, graphical display, profile access and returned markup. "
         "Do not repeatedly retry an unchanged request."
     )
-    if response.http_status == 403:
+    if http_status == 403:
         message = "Tabelog denied browser access or requires verification (HTTP 403)."
         action = "Complete verification manually in the Gurume browser profile; do not repeatedly retry."
-    elif response.http_status is not None and 400 <= response.http_status < 500:
-        message = f"Tabelog returned a permanent browser HTTP failure ({response.http_status})."
+    elif http_status is not None and 400 <= http_status < 500:
+        message = f"Tabelog returned a permanent browser HTTP failure ({http_status})."
         action = (
             "Stop requests and check Tabelog rate limits before making further requests."
-            if response.http_status == 429
-            else "Check the generated search URL and current Tabelog routes; update URL mapping if upstream paths "
-            "changed. Do not repeat the unchanged request."
+            if http_status == 429
+            else f"Check the {'restaurant' if operation == 'detail request' else 'generated search'} URL and "
+            "current Tabelog routes; update URL mapping if upstream paths changed. Do not repeat the unchanged request."
         )
-    elif response.error_retryable:
+    elif retryable:
         action = "Retry later; the browser encountered a transient upstream or navigation failure."
     return ToolErrorOutput(
         error_code="upstream_unavailable",
         message=message,
-        retryable=response.error_retryable is True,
+        retryable=retryable,
         suggested_action=action,
+        detail=detail,
+    )
+
+
+def _browser_search_error(response: SearchResponse) -> ToolErrorOutput:
+    return _browser_error(
+        operation="search",
+        http_status=response.http_status,
+        retryable=response.error_retryable is True,
         detail=response.error_message,
     )
 

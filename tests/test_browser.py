@@ -9,12 +9,15 @@ from unittest.mock import patch
 
 import pytest
 
+from gurume.browser import BrowserDocument
 from gurume.browser import BrowserRetrievalError
+from gurume.browser import _launch_options
 from gurume.browser import fetch_search_document
 from gurume.browser import validate_search_document
 from gurume.search import SearchRequest
 from gurume.search import SearchStatus
 from gurume.server import mcp
+from gurume.server import tabelog_get_restaurant_details
 from gurume.server import tabelog_search_restaurants
 
 HTML = """<div class="c-page-count"><span class="c-page-count__num">1</span></div>
@@ -136,7 +139,7 @@ async def test_browser_one_page_bound():
 @pytest.mark.parametrize("failure", [None, BrowserRetrievalError("blocked", 403), CancelledError()])
 async def test_context_cleanup(tmp_path, failure):
     page = SimpleNamespace(
-        goto=AsyncMock(return_value=SimpleNamespace(status=200)),
+        goto=AsyncMock(return_value=SimpleNamespace(status=200, headers={})),
         content=AsyncMock(return_value=HTML),
         url="https://tabelog.com/mie/rstLst/",
         on=Mock(),
@@ -177,3 +180,73 @@ async def test_missing_optional_dependency():
         pytest.raises(RuntimeError, match=r"gurume\[browser\]"),
     ):
         await fetch_search_document("https://tabelog.com/mie/rstLst/", 30)
+
+
+def test_launch_omits_automation_marker(monkeypatch):
+    monkeypatch.setenv("GURUME_BROWSER_EXECUTABLE", "/opt/chrome/chrome")
+    options = _launch_options()
+    assert options["executable_path"] == "/opt/chrome/chrome"
+    assert options["headless"] is False
+    assert "--enable-automation" in options["ignore_default_args"]
+    assert "--disable-blink-features=AutomationControlled" in options["args"]
+
+
+def test_launch_prefers_installed_browser(monkeypatch):
+    monkeypatch.delenv("GURUME_BROWSER_EXECUTABLE", raising=False)
+    monkeypatch.setattr(
+        "gurume.browser.shutil.which", lambda command: "/usr/bin/chromium" if command == "chromium" else None
+    )
+    assert _launch_options()["executable_path"] == "/usr/bin/chromium"
+    monkeypatch.setattr("gurume.browser.shutil.which", lambda _command: None)
+    assert _launch_options()["executable_path"] is None
+
+
+DETAIL_URL = "https://tabelog.com/tokyo/A1301/A130103/13267696"
+DETAIL_HTML = """<script type="application/ld+json">
+{"@type": "Restaurant", "name": "焼鳥 ひら野", "aggregateRating": {"ratingValue": "3.71", "reviewCount": "22"}}
+</script>"""
+
+
+@pytest.mark.asyncio
+async def test_detail_browser_reads_all_pages_in_one_browser():
+    documents = [
+        BrowserDocument(DETAIL_URL + "/", 200, DETAIL_HTML),
+        BrowserDocument(DETAIL_URL + "/dtlrvwlst/", 200, "<html></html>"),
+        BrowserDocument(DETAIL_URL + "/dtlmenu/", 404, "Not found"),
+        BrowserDocument(DETAIL_URL + "/party/", 200, "<html></html>"),
+    ]
+    fetch = AsyncMock(return_value=documents)
+    with patch("gurume.browser.fetch_documents", fetch), patch("gurume.detail.requests") as http:
+        _, result = await mcp.call_tool(
+            "tabelog_get_restaurant_details", {"restaurant_url": DETAIL_URL + "/", "transport": "browser"}
+        )
+    assert isinstance(result, dict)
+    assert result["status"] == "success"
+    assert result["restaurant"]["name"] == "焼鳥 ひら野"
+    assert result["menu_item_count"] == 0
+    assert fetch.call_args.args[0] == [
+        DETAIL_URL,
+        DETAIL_URL + "/dtlrvwlst/",
+        DETAIL_URL + "/dtlmenu/",
+        DETAIL_URL + "/party/",
+    ]
+    fetch.assert_awaited_once()
+    http.get.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_detail_browser_challenge_is_verification_failure():
+    fetch = AsyncMock(return_value=[BrowserDocument(DETAIL_URL + "/", 403, "<title>Just a moment...</title>")])
+    with patch("gurume.browser.fetch_documents", fetch):
+        result = await tabelog_get_restaurant_details(
+            restaurant_url=DETAIL_URL + "/",
+            fetch_reviews=False,
+            fetch_menu=False,
+            fetch_courses=False,
+            transport="browser",
+        )
+    assert result.status == "error"
+    assert result.error.error_code == "upstream_unavailable"
+    assert result.error.retryable is False
+    assert "verification" in result.error.suggested_action.lower()
+    assert "Gurume browser profile" in result.error.suggested_action

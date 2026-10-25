@@ -442,8 +442,9 @@ class TabelogApp(App):
         ("f3", "show_genre_suggest", "Genre Suggest"),
     ]
 
-    def __init__(self, **kwargs):
+    def __init__(self, *, use_browser: bool = False, **kwargs):
         super().__init__(**kwargs)
+        self.use_browser = use_browser
         self.restaurants: list[Restaurant] = []
         self.selected_restaurant: Restaurant | None = None
         self.search_worker = None
@@ -492,11 +493,17 @@ class TabelogApp(App):
             detail_content.update(f"Searching ({sort_name}): {search_params}...")
 
             request = SearchRequest(area=area, keyword=keyword, genre_code=genre_code_to_use, sort_type=sort_type)
-            response = await request.search()
+            response = await (request.search_browser() if self.use_browser else request.search())
             if response.status == SearchStatus.ERROR:
                 reason = response.error_message or "Upstream service did not return usable results."
                 if response.http_status == 403:
-                    reason = "Tabelog denied access (HTTP 403). Retrying the same request will not help."
+                    reason = (
+                        "Tabelog asked the Gurume browser profile for verification (HTTP 403). "
+                        "Retrying the same request will not help."
+                        if self.use_browser
+                        else "Tabelog denied access (HTTP 403). Retrying the same request will not help. "
+                        "Run gurume tui --transport browser."
+                    )
                 self._update_search_error(RuntimeError(reason))
                 return
             self._handle_search_response(response.restaurants, search_params, sort_name)
@@ -733,9 +740,9 @@ URL: {r.url}
                 )
 
 
-def main():
+def main(*, use_browser: bool = False):
     """Launch the TUI application."""
-    app = TabelogApp()
+    app = TabelogApp(use_browser=use_browser)
     app.run()
 
 

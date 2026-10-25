@@ -12,9 +12,14 @@ from datetime import UTC
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal
+from urllib.parse import parse_qsl
+from urllib.parse import urlencode
 from urllib.parse import urlparse
+from urllib.parse import urlsplit
+from urllib.parse import urlunsplit
 
 from bs4 import BeautifulSoup
+from bs4 import Tag
 from curl_cffi import requests
 from curl_cffi.requests import exceptions as request_errors
 
@@ -22,17 +27,33 @@ from .area_mapping import get_area_slug
 from .genre_mapping import get_genre_name_by_code
 from .http_client import DEFAULT_IMPERSONATE
 from .http_client import http_status_code
+from .restaurant import SEARCH_ENDPOINT
 from .restaurant import Restaurant
 from .restaurant import RestaurantSearchRequest
 from .restaurant import SortType
 from .restaurant import _find_restaurant_cards
 from .restaurant import _is_area_not_found
 from .restaurant import build_search_url_and_params
+from .suggest import AreaSuggestion
+from .suggest import TabelogSuggestUnavailableError
+from .suggest import get_area_suggestions
+from .suggest import get_area_suggestions_async
 
 SEARCH_EXCEPTIONS = (request_errors.RequestException, RuntimeError, ValueError, TypeError)
 CuisineFilterConfidence = Literal["high", "low", "not_applicable"]
 AreaFilterConfidence = Literal["high", "low", "not_applicable"]
 NATIONAL_AREAS = {"全国"}
+
+
+def _find_page_count_block(soup: BeautifulSoup) -> Tag | None:
+    """Return the count block of the paged list; keyword pages show a restaurant-name match count above it."""
+    blocks = soup.select(".c-page-count")
+    return blocks[-1] if blocks else None
+
+
+def _url_with_query(url: str, params: Mapping[str, str]) -> str:
+    """Append params to a URL that may already carry a query, such as a search landing page."""
+    return f"{url}{'&' if '?' in url else '?'}{urlencode(params)}"
 
 
 def _now() -> datetime:
@@ -226,6 +247,58 @@ class SearchRequest:
     include_meta: bool = True
     timeout: float = 30.0
 
+    # Tabelog's search endpoint ignores `sa` unless it carries the area suggestion's type and ID, the way the site's
+    # own search form submits it. It then redirects to the area's list page, dropping `PG`, so later pages are
+    # requested from that landing page.
+    _area_params: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _area_without_suggestions: bool = field(default=False, init=False, repr=False)
+    _landing_url: str | None = field(default=None, init=False, repr=False)
+
+    def _needs_area_ids(self) -> bool:
+        if not self.area or self.area.strip() in NATIONAL_AREAS:
+            return False
+        return bool(self.keyword) or get_area_slug(self.area) is None
+
+    def _remember_area(self, suggestions: list[AreaSuggestion]) -> None:
+        if not suggestions:
+            return
+        area = (self.area or "").strip()
+        match = next((suggestion for suggestion in suggestions if suggestion.name == area), suggestions[0])
+        self._area_params = {
+            "sa": match.name,
+            "sa_input": area,
+            "area_datatype": match.datatype,
+            "area_id": str(match.id_in_datatype),
+        }
+
+    def _resolve_area_sync(self) -> None:
+        if self._area_params or not self._needs_area_ids():
+            return
+        # The suggestion helpers raise for an empty upstream answer, as for an unknown area, and return [] when the
+        # request itself fails; only the first case is reported as an unrecognized area.
+        try:
+            self._remember_area(get_area_suggestions(self.area or ""))
+        except TabelogSuggestUnavailableError:
+            self._area_without_suggestions = True
+
+    async def _resolve_area_async(self) -> None:
+        if self._area_params or not self._needs_area_ids():
+            return
+        try:
+            self._remember_area(await get_area_suggestions_async(self.area or ""))
+        except TabelogSuggestUnavailableError:
+            self._area_without_suggestions = True
+
+    def _remember_landing(self, requested_url: str, final_url: str) -> None:
+        if requested_url != SEARCH_ENDPOINT or not self._area_params or final_url.startswith(SEARCH_ENDPOINT):
+            return
+        parts = urlsplit(final_url)
+        query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key != "PG"]
+        self._landing_url = urlunsplit(parts._replace(query=urlencode(query)))
+
+    def _needs_landing(self) -> bool:
+        return bool(self._area_params) and self.page > 1 and self._landing_url is None
+
     def _parse_meta(
         self,
         html: str,
@@ -237,14 +310,18 @@ class SearchRequest:
         """Parse search metadata."""
         soup = BeautifulSoup(html, "html.parser")
 
-        # Results per page, usually 20.
+        # Results per page, usually 20. Card counts include editorial `list-rst` blocks without a restaurant,
+        # so prefer the displayed `1～20 件を表示 ／ 全 231 件` range.
         results_per_page = 20
         restaurant_items = _find_restaurant_cards(soup)
-        if restaurant_items:
+        if page_size := self._parse_page_size(soup, current_page):
+            results_per_page = page_size
+        elif restaurant_items:
             results_per_page = len(restaurant_items)
 
-        # Total result count.
-        total_count = self._parse_total_count(soup, len(restaurant_items))
+        # Total result count, checked against distinct restaurants: keyword pages list name matches twice.
+        listed_restaurants = {link.get("href") for link in soup.select("a.list-rst__rst-name-target")}
+        total_count = self._parse_total_count(soup, len(listed_restaurants) or len(restaurant_items))
 
         # Total page count.
         total_pages = self._parse_total_pages(soup, total_count, results_per_page, current_page)
@@ -264,8 +341,22 @@ class SearchRequest:
             source_params=source_params or {},
         )
 
+    def _parse_page_size(self, soup: BeautifulSoup, current_page: int) -> int | None:
+        count_block = _find_page_count_block(soup)
+        count_elems = count_block.find_all("span", class_="c-page-count__num") if count_block else []
+        numbers = [self._parse_count_text(element.get_text(" ", strip=True)) for element in count_elems]
+        if len(numbers) != 3:
+            return None
+        first, last, total = numbers
+        if first is None or last is None or total is None or not 0 < first <= last <= total:
+            return None
+        if last < total or current_page == 1:
+            return last - first + 1
+        # The last page shows fewer rows; earlier pages are full, so the offset gives the page size.
+        return (first - 1) // (current_page - 1) or None
+
     def _parse_total_count(self, soup: BeautifulSoup, parsed_item_count: int) -> int | None:
-        count_block = soup.find(class_="c-page-count")
+        count_block = _find_page_count_block(soup)
         count_elems = count_block.find_all("span", class_="c-page-count__num") if count_block else []
         if not count_elems:
             count_elem = soup.find("span", class_="c-page-count__num")
@@ -338,7 +429,12 @@ class SearchRequest:
     def _build_url_and_params(self, request: RestaurantSearchRequest) -> tuple[str, dict[str, str]]:
         params = request._build_params()
         area_slug = get_area_slug(self.area) if self.area else None
-        return build_search_url_and_params(params, area_slug, self.genre_code)
+        url, params = build_search_url_and_params(params, area_slug, self.genre_code)
+        if url != SEARCH_ENDPOINT or not self._area_params:
+            return url, params
+        if self._landing_url is not None and request.page > 1:
+            return self._landing_url, {"PG": params["PG"]}
+        return url, {**params, **self._area_params}
 
     def _stringify_params(self, params: Mapping[str, object]) -> dict[str, str]:
         return {str(key): str(value) for key, value in params.items() if value is not None}
@@ -382,6 +478,7 @@ class SearchRequest:
             _reraise_if_fatal(e)
             raise RuntimeError(str(e)) from e
         else:
+            self._remember_landing(url, str(resp.url))
             return SearchPageResult(
                 html=resp.text,
                 restaurants=request._parse_restaurants(resp.text),
@@ -403,6 +500,7 @@ class SearchRequest:
             _reraise_if_fatal(e)
             raise RuntimeError(str(e)) from e
         else:
+            self._remember_landing(url, str(resp.url))
             return SearchPageResult(
                 html=resp.text,
                 restaurants=request._parse_restaurants(resp.text),
@@ -471,6 +569,15 @@ class SearchRequest:
             meta.area_filter_reason = "national_area"
             return []
 
+        if self._area_without_suggestions:
+            meta.area_filter_applied = False
+            meta.area_filter_confidence = "low"
+            meta.area_filter_reason = f"unrecognized_area:{area}"
+            return [
+                f"filter_mismatch:area: Tabelog area suggestions returned nothing for {area}, so Tabelog could not "
+                "apply it; validate the area with suggestions before searching again."
+            ]
+
         area_slug = get_area_slug(area)
         if area_slug is None:
             meta.area_filter_applied = False
@@ -512,6 +619,10 @@ class SearchRequest:
             all_restaurants: list[Restaurant] = []
             meta = None
 
+            self._resolve_area_sync()
+            if self._needs_landing():
+                self._search_page_sync(self._create_restaurant_request(1))
+
             start_page = self.page
             end_page = self.page + self.max_pages
 
@@ -548,21 +659,25 @@ class SearchRequest:
 
     async def search_browser(self) -> SearchResponse:
         """Fetch one page with an explicitly requested headed browser."""
-        from urllib.parse import urlencode
-
         from .browser import BrowserRetrievalError
         from .browser import fetch_search_document
 
         try:
             if self.max_pages != 1:
                 raise ValueError("Browser search supports exactly one page per invocation")
+            await self._resolve_area_async()
+            if self._needs_landing():
+                first_url, first_params = self._build_url_and_params(self._create_restaurant_request(1))
+                _, landing_url = await fetch_search_document(_url_with_query(first_url, first_params), self.timeout)
+                self._remember_landing(first_url, landing_url)
             request = self._create_restaurant_request(self.page)
             url, params = self._build_url_and_params(request)
-            html, final_url = await fetch_search_document(f"{url}?{urlencode(params)}", self.timeout)
+            html, final_url = await fetch_search_document(_url_with_query(url, params), self.timeout)
+            self._remember_landing(url, final_url)
             restaurants = request._parse_restaurants(html)
             if not restaurants:
                 soup = BeautifulSoup(html, "html.parser")
-                count_block = soup.select_one(".c-page-count")
+                count_block = _find_page_count_block(soup)
                 count_nodes = count_block.select(".c-page-count__num") if count_block else []
                 count_text = (
                     count_nodes[-1].get_text(" ", strip=True)
@@ -597,11 +712,15 @@ class SearchRequest:
             all_restaurants: list[Restaurant] = []
             meta = None
 
+            await self._resolve_area_async()
             async with requests.AsyncSession(
                 timeout=self.timeout,
                 allow_redirects=True,
                 impersonate=DEFAULT_IMPERSONATE,
             ) as client:
+                if self._needs_landing():
+                    await self._search_page_async(client, self._create_restaurant_request(1))
+
                 start_page = self.page
                 end_page = self.page + self.max_pages
 

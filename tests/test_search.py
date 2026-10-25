@@ -5,6 +5,7 @@ from dataclasses import asdict
 from datetime import UTC
 from datetime import datetime
 from typing import cast
+from unittest.mock import AsyncMock
 from unittest.mock import Mock
 from unittest.mock import patch
 
@@ -18,6 +19,8 @@ from gurume.search import SearchMeta
 from gurume.search import SearchRequest
 from gurume.search import SearchResponse
 from gurume.search import SearchStatus
+from gurume.suggest import AreaSuggestion
+from gurume.suggest import TabelogSuggestUnavailableError
 
 
 class TestSearchMeta:
@@ -240,8 +243,9 @@ class TestSearchRequest:
         meta = request._parse_meta(html, current_page=1)
 
         assert meta.total_count == 138635
-        assert meta.results_per_page == 5
-        assert meta.total_pages == 27727
+        # The displayed 1～20 range sets the page size; card counts include editorial blocks.
+        assert meta.results_per_page == 20
+        assert meta.total_pages == 6932
         assert meta.has_next_page is True
 
     def test_parse_meta_ignores_impossible_count_lower_than_results(self):
@@ -872,3 +876,127 @@ class TestBuildSearchUrlAndParams:
         assert params["sk"] == "寿司"
         assert params["sw"] == "寿司"
         assert params["LstG"] == "RC0201"
+
+
+def test_parse_meta_reads_page_size_from_displayed_range_on_last_page():
+    html = (
+        '<div class="c-page-count"><span class="c-page-count__num"><strong>221</strong></span>～'
+        '<span class="c-page-count__num"><strong>231</strong></span> 件を表示 ／ 全 '
+        '<span class="c-page-count__num"><strong>231</strong></span> 件</div>' + '<div class="list-rst"></div>' * 12
+    )
+
+    meta = SearchRequest()._parse_meta(html, current_page=12)
+
+    assert meta.results_per_page == 20
+    assert meta.total_pages == 12
+    assert meta.has_next_page is False
+
+
+SHIBUYA_STATION = AreaSuggestion(name="渋谷駅", datatype="RailroadStation", id_in_datatype=4698)
+SHIBUYA_TOWN = AreaSuggestion(name="渋谷(東京都 渋谷区)", datatype="Town", id_in_datatype=36621)
+SHIBUYA_CARD = (
+    '<div class="c-page-count"><span class="c-page-count__num">1</span>～<span class="c-page-count__num">20</span>'
+    '件 ／ 全 <span class="c-page-count__num">28</span> 件</div><div class="list-rst">'
+    '<a class="list-rst__rst-name-target" href="https://tabelog.com/tokyo/A1303/A130301/13000001/">渋谷ハンバーグ</a>'
+    "</div>"
+)
+SHIBUYA_LANDING = "https://tabelog.com/tokyo/A1303/A130301/R4698/rstLst/?vs=1&sa=%E6%B8%8B%E8%B0%B7%E9%A7%85&sk=x"
+
+
+@pytest.mark.parametrize(("area", "expected"), [("渋谷", SHIBUYA_STATION), ("渋谷(東京都 渋谷区)", SHIBUYA_TOWN)])
+def test_area_suggestion_prefers_exact_name_then_first(area, expected):
+    request = SearchRequest(area=area, keyword="ハンバーグ")
+    request._remember_area([SHIBUYA_STATION, SHIBUYA_TOWN])
+
+    assert request._area_params == {
+        "sa": expected.name,
+        "sa_input": area,
+        "area_datatype": expected.datatype,
+        "area_id": str(expected.id_in_datatype),
+    }
+
+
+@pytest.mark.asyncio
+async def test_browser_keyword_search_sends_area_ids_and_pages_through_landing_url(monkeypatch):
+    monkeypatch.setattr("gurume.search.get_area_suggestions_async", AsyncMock(return_value=[SHIBUYA_STATION]))
+    fetch = AsyncMock(side_effect=[(SHIBUYA_CARD, SHIBUYA_LANDING), (SHIBUYA_CARD, SHIBUYA_LANDING + "&PG=2")])
+
+    with patch("gurume.browser.fetch_search_document", fetch):
+        result = await SearchRequest(area="渋谷", keyword="ハンバーグ", page=2).search_browser()
+
+    first_url, second_url = (call.args[0] for call in fetch.await_args_list)
+    assert first_url.startswith("https://tabelog.com/rst/rstsearch?")
+    assert "area_datatype=RailroadStation" in first_url
+    assert "area_id=4698" in first_url
+    assert "PG=1" in first_url
+    assert second_url == SHIBUYA_LANDING + "&PG=2"
+    assert result.status == SearchStatus.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_unrecognized_area_is_reported_instead_of_silent_no_results(monkeypatch):
+    monkeypatch.setattr(
+        "gurume.search.get_area_suggestions_async", AsyncMock(side_effect=TabelogSuggestUnavailableError("empty"))
+    )
+    html = (
+        '<div class="rstlst-search-header__suggest-tooltip"><p>該当のエリア・駅が見つかりませんでした。</p></div>'
+        + SHIBUYA_CARD
+    )
+    fetch = AsyncMock(return_value=(html, "https://tabelog.com/rstLst/?vs=1"))
+
+    with patch("gurume.browser.fetch_search_document", fetch):
+        result = await SearchRequest(area="ほげほげ地区", keyword="寿司").search_browser()
+
+    assert result.status == SearchStatus.NO_RESULTS
+    assert any("returned nothing for ほげほげ地区" in warning for warning in result.warnings)
+    assert "area_id" not in fetch.call_args.args[0]
+
+
+def test_keyword_page_dedupes_name_matches_and_reads_paged_count():
+    def card(restaurant_id: str) -> str:
+        return (
+            '<div class="list-rst"><a class="list-rst__rst-name-target" '
+            f'href="https://tabelog.com/tokyo/A1303/A130301/{restaurant_id}/">{restaurant_id}</a></div>'
+        )
+
+    html = (
+        '<div class="c-page-count">店名に「ハンバーグ」を含むレストラン <span class="c-page-count__num">1</span>～'
+        '<span class="c-page-count__num">2</span> 件 ／ 全 <span class="c-page-count__num">2</span> 件</div>'
+        + card("13000001")
+        + card("13000002")
+        + '<div class="c-page-count">口コミ・お店の情報に「ハンバーグ」を含むレストラン '
+        '<span class="c-page-count__num">1</span>～<span class="c-page-count__num">20</span> 件 ／ 全 '
+        '<span class="c-page-count__num">28</span> 件</div>'
+        + card("13000002")
+        + card("13000003")
+    )
+    request = SearchRequest(area="渋谷", keyword="ハンバーグ")
+
+    restaurants = request._create_restaurant_request()._parse_restaurants(html)
+    meta = request._parse_meta(html, current_page=1)
+
+    assert [restaurant.name for restaurant in restaurants] == ["13000001", "13000002", "13000003"]
+    assert meta.total_count == 28
+    assert meta.results_per_page == 20
+    assert meta.total_pages == 2
+
+
+def test_total_count_check_uses_distinct_restaurants():
+    def card(restaurant_id: str) -> str:
+        return (
+            '<div class="list-rst"><a class="list-rst__rst-name-target" '
+            f'href="https://tabelog.com/tokyo/A1303/A130301/{restaurant_id}/">{restaurant_id}</a></div>'
+        )
+
+    def count(last: int, total: int) -> str:
+        return (
+            '<div class="c-page-count"><span class="c-page-count__num">1</span>～'
+            f'<span class="c-page-count__num">{last}</span> 件 ／ 全 '
+            f'<span class="c-page-count__num">{total}</span> 件</div>'
+        )
+
+    html = count(2, 2) + card("1") + card("2") + count(3, 3) + card("1") + card("2") + card("3")
+
+    meta = SearchRequest(area="渋谷", keyword="一蘭")._parse_meta(html, current_page=1)
+
+    assert meta.total_count == 3
